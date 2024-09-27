@@ -1,5 +1,7 @@
 local M = {}
-local Job = require 'plenary.job'
+local job = require 'plenary.job'
+local async = require 'plenary.async'
+local popup = require 'plenary.popup'
 
 local function get_api_key(name)
   return os.getenv(name)
@@ -107,6 +109,27 @@ function M.write_string_at_cursor(str)
   end)
 end
 
+local function create_popup(title)
+  local width = 80
+  local height = 20
+  local buf = vim.api.nvim_create_buf(false, true)
+  local win = popup.create(buf, {
+    title = title,
+    borderchars = { '─', '│', '─', '│', '┌', '┐', '┘', '└' },
+    width = width,
+    height = height,
+    minheight = height,
+    maxheight = 30,
+    line = math.floor((vim.o.lines - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    wrap=true
+  })
+
+  -- Set the window options
+
+  return buf, win
+end
+
 local function get_prompt(opts)
   local replace = opts.replace
   local visual_lines = M.get_visual_selection()
@@ -124,25 +147,37 @@ local function get_prompt(opts)
     prompt = M.get_lines_until_cursor()
   end
 
-  return prompt
+  return prompt .. '\n'
 end
 
-function M.handle_anthropic_spec_data(data_stream, event_state)
+local function get_prompt_ui(opts)
+    local code_selection = get_prompt(opts)
+    local user_prompt = async.open_prompt_ui()
+    return code_selection .. user_prompt
+end
+
+function M.handle_anthropic_spec_data(buf, data_stream, event_state)
   if event_state == 'content_block_delta' then
     local json = vim.json.decode(data_stream)
     if json.delta and json.delta.text then
       M.write_string_at_cursor(json.delta.text)
+      -- vim.schedule(function ()
+      --     vim.api.nvim_buf_set_text(buf, -1, -1, -1, -1, vim.split(json.delta.text, '\n'))
+      -- end)
     end
   end
 end
 
-function M.handle_openai_spec_data(data_stream)
+function M.handle_openai_spec_data(buf, data_stream)
   if data_stream:match '"delta":' then
     local json = vim.json.decode(data_stream)
     if json.choices and json.choices[1] and json.choices[1].delta then
       local content = json.choices[1].delta.content
       if content then
         M.write_string_at_cursor(content)
+          -- vim.schedule(function ()
+          --     vim.api.nvim_buf_set_text(buf, -1, -1, -1, -1, vim.split(content, '\n'))
+          -- end)
       end
     end
   end
@@ -158,6 +193,8 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
   local args = make_curl_args_fn(opts, prompt, system_prompt)
   local curr_event_state = nil
 
+  -- local output_buf = create_popup("LLM Output")
+
   local function parse_and_call(line)
     local event = line:match '^event: (.+)$'
     if event then
@@ -166,7 +203,7 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
     end
     local data_match = line:match '^data: (.+)$'
     if data_match then
-      handle_data_fn(data_match, curr_event_state)
+      handle_data_fn(output_buf, data_match, curr_event_state)
     end
   end
 
@@ -175,7 +212,24 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
     active_job = nil
   end
 
-  active_job = Job:new {
+  local function after_output() 
+      vim.schedule(function ()
+          vim.api.nvim_buf_set_option(output_buf, "modifiable", false)
+      end)
+      wait(-1, function ()
+          local key = vim.v.event.key
+          if key == 'y' then 
+              -- paste the text in the buffer
+              return true
+          elseif key == 'n' then
+              return true
+          else
+              return false
+          end
+      end)
+  end
+
+  active_job = job:new {
     command = 'curl',
     args = args,
     on_stdout = function(_, out)
@@ -203,6 +257,12 @@ function M.invoke_llm_and_stream_into_editor(opts, make_curl_args_fn, handle_dat
 
   vim.api.nvim_set_keymap('n', '<Esc>', ':doautocmd User DING_LLM_Escape<CR>', { noremap = true, silent = true })
   return active_job
+end
+
+
+function M.test() 
+    -- open_prompt_ui("test")
+    -- create_popup("Prompt")
 end
 
 return M
